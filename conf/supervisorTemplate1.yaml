@@ -1,0 +1,63 @@
+#
+# storm configuration file
+#
+storm.zookeeper.servers:
+    - "phxjupiter-590391.stratus.phx.ebay.com"
+    - "phxjupiter-590390.stratus.phx.ebay.com"
+    - "phxjupiter-590389.stratus.phx.ebay.com"
+    - "phxjupiter-590388.stratus.phx.ebay.com"
+    - "phxjupiter-590387.stratus.phx.ebay.com"
+    - "phxjupiter-590386.stratus.phx.ebay.com"
+    - "phxjupiter-590385.stratus.phx.ebay.com"
+
+nimbus.seeds: ["phxjupiter-590383.stratus.phx.ebay.com","phxjupiter-590384.stratus.phx.ebay.com"]
+
+#topology.metrics.consumer.register:
+#  - class: "backtype.storm.metric.LoggingMetricsConsumer"
+#    parallelism.hint: 1
+
+
+# netty transport
+storm.messaging.transport: "org.apache.storm.messaging.netty.Context"
+storm.messaging.netty.server_worker_threads: 1
+storm.messaging.netty.client_worker_threads: 1
+storm.messaging.netty.buffer_size: 5242880
+storm.messaging.netty.max_retries: 30
+storm.messaging.netty.max_wait_ms: 1000
+storm.messaging.netty.min_wait_ms: 100
+
+
+#java settings
+#worker.childopts: "-Xmx1024m"
+#worker.childopts: "-Xmx1536m"
+#supervisor.childopts: "-Xmx256m"
+#nimbus.childopts: "-Xmx1024m"
+#ui.childopts: "-Xmx768m"
+#nimbus.thrift.threads: 256
+
+#itopology.metrics.consumer.register:
+#  - class: "com.ebay.hubble.metrics.storm.HubbleMetricsConsumer"
+#    parallelism.hint: 1
+#    argument:
+#      straas.hubble.conf.file: "/etc/storm/hubble-storm.conf"
+
+supervisor.slots.ports:
+    - 6700
+    - 6701
+    - 6702
+    - 6703
+    - 6704
+    - 6705
+    - 6706
+    - 6707
+
+#how long supervisor will wait to ensure that a worker process is started
+supervisor.worker.start.timeout.secs: 600
+
+#how long between heartbeats until supervisor considers that worker dead and tries to restart it
+supervisor.worker.timeout.secs: 300
+
+
+#nimbus.childopts: "-Dcom.sun.management.jmxremote.port=9999 -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false "
+worker.childopts: "-Dcom.sun.management.jmxremote.port=1%ID% -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false "
+supervisor.childopts: "-Dcom.sun.management.jmxremote.port=9999 -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false "

@@ -1,0 +1,300 @@
+#!/bin/bash
+# Author: Barry Shao
+# Version: 1.0
+#https://docs.google.com/document/d/17CHTw2JrNFd6OxSxtsNI9fxUnzEZBiL8pviabDZwpKI/edit?ts=566f1e97
+
+#node type master -> nimbus, worker -> supervisor
+set -e
+set -o pipefail
+
+prgm=`basename $0`
+FORCE=false
+ADDWORKER=false
+stormTarball="apache-storm-0.9.2-incubating.tar.gzip"
+
+printBanner (){
+	echo "========================================================"
+	echo "++++   $@"
+	echo "========================================================"
+}
+
+usage (){
+     echo "
+Usage: 
+     $prgm -c COLO -e COS -m nimbus_host -w superviser_hosts -z zookeeper_hosts -p HOST [-f] [-v stormTarball] [--conf zkServers=host1,host2:nimbus=hosts:slots=NUM] [--mas applicationServices] [--zas applicationServices] [--was applicationServices]
+     $prgm -c COLO -e COS --add superviser_hosts -m nimbus_host
+
+This is used to provision a storm node, one host could be either a supervisor or a nimbus or a zookeeper
+
+     -c 	COLO is slc, phx or lvs, it's used for colo-specific configuration
+     -e 	environment: prod,qa(be default)
+     -m 	numbus host
+     -w 	supervisor hosts, comma seperated
+     -z 	zookeeper hosts, comma seperated
+     -f 	force to provision, overwriting existing storm incubating and configuration
+     -p		nimbus host from whose supervisor we copy montage.{COS}.property, if a host is passed to -m, we use it.
+     -v 	storm tarball name in cronus srepo, check http://cronus-srepo.vip.ebay.com/packages/mp/montageapi/storm/static_content/ebay/montage/
+     --conf 	cusotimzed configuration, colon seperated
+     --add 	add supervisor nodes to storm cluster, copy applicationServices, montage.{COS}.property from peers
+     --mas      comman-seperated list of ApplicationServcie resourceID for provisioned nimbus(master) boxes
+     --zas      comman-seperated list of ApplicationServcie resourceID for provisioned zookeeper boxes
+     --was      comman-seperated list of ApplicationServcie resourceID for provisioned worker(supervisor) boxes
+Example:
+     1. set up a new storm cluster
+     $prgm -c lvs -e qa -m nimbus-qa.lvs.ebay.com -w supervisor-qa1.lvs.ebay.com,supervisor-qa2.lvs.ebay.com -z zk1-qa.lvs.ebay.com,zk2-qa.lvs.ebay.com
+     
+     2. add new supervisor nodes to cluster
+     $prgm -c lvs -e qa --add supervisor-qa3.lvs.ebay.com,supervisor-qa4.lvs.ebay.com -m nimbus-qa.lvs.ebay.com"
+}
+
+
+while getopts "c:e:m:w:z:p:-:hfv:" opt; do
+  case $opt in
+    -)
+      case "$OPTARG" in
+          add)
+              ADDWORKER=true
+              workerHosts=${!OPTIND}
+              OPTIND=$(( $OPTIND + 1 ))
+              ;;
+          conf)
+              customizedConfs=${!OPTIND}
+              OPTIND=$(( $OPTIND + 1 ))
+              ;;
+           mas)
+                 mApplicationServices=${!OPTIND}
+                 mApplicationServices=${mApplicationServices//,/\\,}
+                 ((OPTIND++))
+                 ;;
+           zas)
+                 zApplicationServices=${!OPTIND}
+                 zApplicationServices=${zApplicationServices//,/\\,}
+                 ((OPTIND++))
+                 ;;
+           was)
+                 wApplicationServices=${!OPTIND}
+                 wApplicationServices=${wApplicationServices//,/\\,}
+                 ((OPTIND++))
+                 ;;
+      esac;;
+    w)
+      workerHosts="$OPTARG"
+      ;;
+    m)
+      masterHost="$OPTARG"
+      activeMasterHost="${masterHost%%,*}"
+      ;;
+    z)
+      zkHosts="$OPTARG"
+      ;;
+    p)
+      nimbusHavingProperty="$OPTARG"
+      ;;
+    c)
+      COLO=$(echo "$OPTARG"|tr '[:upper:]' '[:lower:]')
+      ;;
+    f)
+      FORCE=true
+      ;;
+    e)
+      COS="$(echo $OPTARG|tr '[:upper:]' '[:lower:]')"
+      if [[ ${COS:0:4} == prod ]];then 
+          COS=production
+      fi
+      ;;
+    v)
+     stormTarball="$OPTARG"
+      ;;
+    \?|h)
+       usage
+       exit 
+       ;;
+  esac
+done
+
+if [[ -z "$COS" || -z "$COLO" || -z $workerHosts || -z $masterHost || "$COLO" != slc && "$COLO" != phx && "$COLO" != lvs ]] || [[ $ADDWORKER == false && -z "$zkHosts" ]]; then
+      usage
+      exit 2
+
+fi
+
+if [[ -z "$nimbusHavingProperty" && "$ADDWORKER" == true && -n "$activeMasterHost" ]];then
+	nimbusHavingProperty="$activeMasterHost"
+fi
+
+#prerequisite: fabric client
+printBanner "checking fabric client"
+if ! command -v fab >/dev/null;then
+        printBanner "fabric client is not installed, let me do it for you"
+        echo sudo apt-get -y install fabric
+        sudo apt-get -y install fabric
+        if [[ $? -ne 0 ]];then
+                printBanner "failed to install fabric client, please fix it first"
+                exit 1
+        fi
+else
+        printBanner "fabric cleint is alreday installed"
+fi
+
+editZKNimbusInTemplate (){
+	template="$1"
+	#empty lines must exist between text blocks, need enhancement later
+	sed -i '/storm.zookeeper.servers/,/^$/{/-/d}' $template 
+	echo "$zkHosts" | tr "," "\n" | while read host;do
+		sed -i "/storm.zookeeper.servers/a\ \ \ \ - \"$host\"" $template
+	done
+
+	if [[ $stormTarball == apache-storm-0.9* ]];then
+		sed -i "s/nimbus.host:.*/nimbus.host: \"$masterHost\"/" $template
+	elif [[ $stormTarball == apache-storm-1* ]];then
+		unset nimbuses
+		for host in `echo "$masterHost" | tr "," "\n"`;do
+			nimbuses+="\"$host\","
+		done
+		nimbuses=${nimbuses%,}
+		sed -i "s/nimbus.seeds.*/nimbus.seeds: [$nimbuses]/" $template
+	fi
+	if [[ $template == nimbus* ]];then
+		cp $template nimbusTemplate.yaml
+	else
+		cp $template supervisorTemplate.yaml
+	fi
+}
+
+genConf4Worker (){
+	if [[ $stormTarball == apache-storm-0.9* ]];then
+		editZKNimbusInTemplate supervisorTemplate0.yaml
+	elif [[ $stormTarball == apache-storm-1* ]];then
+		editZKNimbusInTemplate supervisorTemplate1.yaml
+	fi
+
+	printBanner "Here is storm.yaml for supervisor, please review it"
+	cat supervisorTemplate.yaml
+	echo "Do you want to manaully edit it? (press Enter for N)[Y/N]"
+	read confirm
+	if [[ $confirm == "Y" || $confirm == "y" ]];then
+		vi supervisorTemplate.yaml
+	fi
+}
+
+genConf4Master (){
+	if [[ $stormTarball == apache-storm-0.9* ]];then
+		editZKNimbusInTemplate nimbusTemplate0.yaml
+	elif [[ $stormTarball == apache-storm-1* ]];then
+		editZKNimbusInTemplate nimbusTemplate1.yaml
+	fi
+
+	printBanner "Here is storm.yaml for nimbus, please review it"
+	cat nimbusTemplate.yaml
+	echo "Do you want to manaully edit it?(press Enter for N) [Y/N]"
+	read confirm
+	if [[ $confirm == "Y" || $confirm == "y" ]];then
+		vi nimbusTemplate.yaml
+	fi
+}
+
+genConf4ZK (){
+	sed -i '/server.[1-9][1-9]*=/d' zkTemplate.cfg
+	id=1
+	echo "$zkHosts" | tr "," "\n" | while read host;do
+		printf 'server.%d=%s:2888:3888\n' $id $host >> zkTemplate.cfg
+		id=$(( $id + 1))
+	done
+	printBanner "Here is zoo.cfg for zookeeper, please review it"
+	cat zkTemplate.cfg
+	echo "Do you want to manaully edit it?(press Enter for N) [Y/N]"
+	read confirm
+	if [[ $confirm == "Y" || $confirm == "y" ]];then
+		vi zkTemplate.cfg
+	fi
+}
+
+selfAbsPath="$(readlink -f $0)"
+binDir="$(dirname $selfAbsPath)" 
+baseDir="$(dirname $binDir)"
+confDir="${baseDir}/conf"
+
+read -s -r -p "To login and set up Storm, please provide your corp password if in dev or prod password if in prod :" pass
+echo
+
+[[ -n $masterHost ]] && allHosts="$masterHost"
+[[ -n $workerHosts ]] && allHosts="${allHosts},$workerHosts"
+[[ -n $zkHosts ]] && allHosts="${allHosts},$zkHosts"
+
+printBanner "Checking sudoer list in all hosts"
+fab -H "$allHosts"  can_sudo -p "$pass" </dev/null 
+if [[ $? != 0 ]];then
+	exit 1
+fi
+
+if [[ -n $nimbusHavingProperty ]];then
+	url="http://${nimbusHavingProperty}:8090/api/v1/supervisor/summary"
+	printBanner getting supervisor list from "$url"
+	curl -v "$url" | grep -o 'host":"[^"]*'|cut -d\" -f3|while read peer;do
+		printBanner "Getting montage.${COS}.properties from peer supervisor: $peer"
+		cd "$binDir"
+		fab -H "$peer" getRemote:/ebay/montage.$COS.properties,"${confDir}/" -p "$pass" </dev/null && break
+	done
+
+	if [[ $? -ne 0 ]];then
+		printBanner "failed to get montage.${COS}.properties from peer supervisor $peer, quitting"
+		exit
+	fi
+fi
+
+if [[ $ADDWORKER == true ]];then
+	url="http://${activeMasterHost}:8090/api/v1/supervisor/summary"
+	printBanner getting supervisor list from "$url"
+	peers="$(curl -v "$url"|grep -o 'host":"[^"]*'|cut -d\" -f3)"
+	echo "$peers" | while read peer;do
+		printBanner "Getting storm.yaml from peer supervisor: $peer"
+		#scp -o StrictHostKeyChecking=no ${peer}:/usr/share/storm/conf/storm.yaml ${confDir}/supervisorTemplate.yaml && break
+		cd "$binDir"
+		fab -H "$peer" getRemote:/usr/share/storm/conf/storm.yaml,"${confDir}/supervisorTemplate.yaml" -p "$pass" </dev/null && break
+	done
+
+	if [[ ! -f ${confDir}/supervisorTemplate.yaml ]] || (( $(date +%s) - $(stat -c %Y ${confDir}/supervisorTemplate.yaml) > 60* 3 ));then
+		printBanner "failed to get storm.yaml from peer supervisors, quitting"
+		exit
+	fi
+	
+	if [[ -z $wApplicationServices ]]; then
+		echo "$peers" | while read peer;do
+			printBanner "Getting applicationServcies from peer supervisor: $peer"
+			cd "$binDir"
+			fab -H "$peer" getRemote:/opt/Tivoli/lcf/dat/1/odb_function.txt,"${confDir}" -p "$pass" </dev/null && break
+		done
+		if [[ ! -f ${confDir}/odb_function.txt ]]; then
+			printBanner "failed to get applicationServcies from peer supervisors, the peers don't have it"
+		else
+			wApplicationServices="$(cat ${confDir}/odb_function.txt|head -1)"
+			wApplicationServices="${wApplicationServices//,/\\,}"
+		fi
+	fi
+
+	printBanner "Provision new supervisors: $workerHosts"
+
+	cd "$binDir"
+	fab -H "$workerHosts" supervisor:$COS,$COLO,$stormTarball,"$wApplicationServices" -p "$pass"
+
+	rm -f "${confDir}/montage.$COS.properties" ${confDir}/odb_function.txt
+	exit
+fi
+
+cd "$confDir"
+
+genConf4ZK
+genConf4Master
+genConf4Worker
+
+cd "$binDir"
+
+fab -H "$zkHosts" zookeeper:$COS,$COLO,$stormTarball,"$zApplicationServices" -p "$pass"
+fab -H "$masterHost" nimbus:$COS,$COLO,$stormTarball,"$mApplicationServices" -p "$pass"
+fab -H "$workerHosts" supervisor:$COS,$COLO,$stormTarball,"$wApplicationServices" -p "$pass"
+rm -f "${confDir}/montage.$COS.properties"
+
+for host in `echo "$masterHost" | tr "," "\n"`;do
+	nimbusUI+="http://$host:8090 "
+done
+printBanner "check your Nimbus UI in $nimbusUI"

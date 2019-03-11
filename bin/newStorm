@@ -1,0 +1,306 @@
+#!/bin/bash
+# Author: Barry Shao
+# Version: 1.0
+#https://docs.google.com/document/d/17CHTw2JrNFd6OxSxtsNI9fxUnzEZBiL8pviabDZwpKI/edit?ts=566f1e97
+
+#node type master -> nimbus, worker -> supervisor
+
+FORCE=false
+filer="cronus-srepo.vip.ebay.com"
+stormTarball="apache-storm-0.9.2-incubating.tar.gzip"
+javaVersion=7
+stormJavaVersion='java version "1.7.0_55"
+Java(TM) SE Runtime Environment (build 1.7.0_55-b13)
+Java HotSpot(TM) 64-Bit Server VM (build 24.55-b03, mixed mode)'
+
+printBanner (){
+	echo "========================================================"
+	echo "++++   $@"
+	echo "========================================================"
+}
+
+installTivoli (){
+	printBanner "Install Tivoli"
+	if pgrep -fl lcfd; then
+		printBanner "Tivoli agent is running"
+	else
+		curl "http://tmr2slc.vip.ebay.com/stats/deldupep.cgi?username=cloudmgr&ep=`hostname -f`"
+		mkdir -p /opt/Tivoli
+		output=`uname -a`
+		if [[ $output != *Ubuntu* ]];then
+			echo "currently only install tivoli in Ubuntu"
+		else
+			wget 'http://tmr-master.vip.ebay.com/lcf/lcfd-41146-ubuntu.tar' -O /tmp/lcfd-41146-ubuntu.tar
+			apt-get -y install libc6-i386
+			mv /opt/Tivoli/lcf/dat/1/odb_function.txt /opt/Tivoli/
+			tar Pxvf /tmp/lcfd-41146-ubuntu.tar
+			/opt/Tivoli/lcf/do_install.sh
+			mv /opt/Tivoli/odb_function.txt /opt/Tivoli/lcf/dat/1/
+		fi
+	fi
+}
+
+usage (){
+     echo "
+Usage: 
+     $0 -e COS -c COLO [-w|-m] [-f] [-v versionString] [-a applicationServices]
+     $0 -e COS -c COLO [-z] [-f] [-a applicationServices]
+
+This is used to provision a storm node, one host could be either a supervisor or a nimbus or a zookeeper
+
+     -c 	COLO is slc, phx or lvs, it's used for colo-specific configuration
+     -e 	environment: prod,qa
+     -w 	provision a supervisor node
+     -m 	provisioning a nimbus node
+     -z 	provisioning a zookeeper
+     -f 	force to provision, overwriting existing storm incubating and configuration
+     -v 	storm tarball name in cronus srepo, check http://cronus-srepo.vip.ebay.com/packages/mp/montageapi/storm/static_content/ebay/montage/
+     -a         comman-seperated list of ApplicationServcie resourceID for provisioned boxes"
+}
+
+installJava (){
+	printBanner "Installing java"
+	printf "Downloading Java from Cronus SREPO\n\n"
+	if [[ $javaVersion == 8 ]];then
+		javaTarball=jvm8.tar.gzip
+	elif [[ $javaVersion == 7 ]];then
+		javaTarball=jvm.tar.gzip
+	fi
+rm -vf /tmp/jvm.tar.gzip
+	wget -c "http://$filer/packages/mp/montageapi/storm/static_content/ebay/montage/$javaTarball" -O /tmp/jvm.tar.gzip
+	tar xzf /tmp/jvm.tar.gzip -C /usr/lib/
+}
+
+download () {
+	source="$1"
+	dest="$2"
+	wget -q "http://$filer/packages/mp/montageapi/storm$source" -O "$dest"
+	if [[ $? -gt 0 ]];then 
+		echo failed to download "http://$filer/packages/mp/montageapi/storm$source"
+		exit 5
+	fi
+}
+
+while getopts "wmzhfc:e:v:a:" opt; do
+  case $opt in
+    a)
+      applicationServices="$OPTARG"
+      ;;
+    w)
+      nodeType=supervisor
+      ;;
+    m)
+      nodeType=nimbus
+      ;;
+    z)
+      nodeType=zookeeper
+      ;;
+    c)
+     COLO=$(echo "$OPTARG"|tr '[:upper:]' '[:lower:]')
+     ;;
+    f)
+     FORCE=true
+     ;;
+    e)
+     COS="$(echo $OPTARG|tr '[:upper:]' '[:lower:]')"
+      if [[ ${COS:0:4} == prod ]];then 
+          COS=production
+      fi
+     ;;
+    v)
+     stormTarball="$OPTARG"
+     if [[ $stormTarball == apache-storm-1.0* ]];then
+          javaVersion=8
+          stormJavaVersion='java version "1.8.0_92"
+Java(TM) SE Runtime Environment (build 1.8.0_92-b14)
+Java HotSpot(TM) 64-Bit Server VM (build 25.92-b14, mixed mode)'
+     fi
+     ;;
+    \?|h)
+      usage
+      exit 
+      ;;
+  esac
+done
+
+if [[ -z "$COS" || -z "$COLO" || -z "$nodeType" || "$COLO" != slc && "$COLO" != phx && "$COLO" != lvs ]]; then
+      usage
+      exit 2
+fi
+
+printBanner "Provisioning a $nodeType node in $COLO"
+
+if [[ $(which java) ]]; then
+	printBanner "Java is already installed, validating its version"
+	currentJavaVersion="$(java -version 2>&1)"
+
+	if [[ "$stormJavaVersion" != "$currentJavaVersion" ]];then
+		printf "The required version is \n$stormJavaVersion \n\n"
+		printf "The current version is \n$currentJavaVersion \n\n"
+		printf "Do you want to re-install Java [Y/N]?"
+		read reinstall
+		if [[ $reinstall == "Y" || $reinstall == "y" ]];then
+			installJava
+		else
+			echo "Skipping Java installation"
+		fi
+	else
+		echo "Java version is correct, skipping Java installation"
+	fi
+else
+	installJava
+fi
+ln -nsf /usr/lib/jvm/jre/bin/java /etc/alternatives/java
+ln -nsf /etc/alternatives/java /usr/bin/java
+
+if [[ "$nodeType" == "supervisor" || "$nodeType" == "nimbus" ]];then
+	printBanner "checking existence of storm account"
+	stormEntry=$(cat /etc/passwd | grep storm)
+	if [[ -n $stormEntry ]]; then
+		echo storm account exists
+		echo "$stormEntry"
+	else 
+		adduser --quiet --disabled-password -gecos "created by $0" storm
+		printBanner "storm account is created"
+	fi
+elif [[ "$nodeType" == "zookeeper" ]];then
+        printBanner "checking existence of zookeeper account"
+        zookeeperEntry=$(cat /etc/passwd | grep zookeeper >/dev/null)
+        if [[ -n $zookeeperEntry ]]; then
+                printBanner "zookeeper account exists"
+                echo "$zookeeperEntry"
+        else 
+                adduser --quiet --disabled-password -gecos "created by $0" --home /usr/share/zookeeper zookeeper
+                printBanner "zookeeper account is created"
+        fi
+fi
+
+if [[ -n "$applicationServices" ]];then
+	mkdir -p /opt/Tivoli/lcf/dat/1/
+	echo "$applicationServices" >  /opt/Tivoli/lcf/dat/1/odb_function.txt
+	printBanner "Application services ($applicationServices) is written into odb_function.txt"
+else
+	printBanner "Application services is not found, skip od_function.txt creation"
+fi
+
+if [[ "$nodeType" == "supervisor" || "$nodeType" == "nimbus" ]];then
+	stormFolder="${stormTarball%.tar*}"
+	if [[ FORCE || ! -d "/usr/share/$stormFolder" ]]; then
+		printBanner "Installing $nodeType binary"
+		download /static_content/ebay/montage/$stormTarball /tmp/${stormTarball}
+		tar xzf /tmp/${stormTarball} -C /usr/share/
+		ln -nsf /usr/share/${stormFolder} /usr/share/storm
+		ln -nsf /usr/share/storm/bin/storm /usr/bin/storm
+		chown storm:storm /usr/share/storm
+		if [[ $stormFolder == apache-storm-0.9* ]];then
+			mkdir /var/log/storm
+			chown storm:storm /var/log/storm
+		fi
+	fi
+	printBanner "$nodeType binary installed"
+
+	if [[ FORCE || ! -e /home/storm/reset_supervisor.sh ]];then
+		printBanner "Installing reset_supervisor.sh"
+		download /static_content/ebay/montage/reset_supervisor.sh /home/storm/reset_supervisor.sh
+		chown storm:storm /home/storm/reset_supervisor.sh
+		chmod 700 /home/storm/reset_supervisor.sh
+	fi
+	printBanner "reset_supervisor.sh installed"
+
+	[ ! -d /ebay ] && mkdir /ebay
+	if [[ ! -e /ebay/.metadata ]];then
+		echo "classOfService=$COS" > /ebay/.metadata
+		chmod 644 /ebay/.metadata
+	fi
+	printBanner "/ebay/.metadata is installed `cat /ebay/.metadata`"
+
+	if [[ "$nodeType" == "supervisor" && ! -e /ebay/montage.${COS}.properties ]];then
+		if [[ -e /tmp/montage.${COS}.properties ]];then
+			#download /static_content/ebay/montage/conf/montage.${COS}.properties /ebay/montage.${COS}.properties
+			cp -f /tmp/montage.${COS}.properties /ebay/montage.${COS}.properties
+			chown storm:storm /ebay/montage.${COS}.properties
+			chmod 600 /ebay/montage.${COS}.properties
+			printBanner "/ebay/montage.${COS}.properties is installed"
+		else
+			printBanner "/ebay/montage.${COS}.properties is NOT installed"
+		fi
+	fi
+
+	download /static_content/ebay/montage/conf/sysctl.conf /etc/sysctl.conf
+	printBanner "network parameters are set"
+	sysctl -p
+
+	download /static_content/ebay/montage/conf/limits.conf /etc/security/limits.conf
+	ulimit -n 999999
+	ulimit -u 999999
+	printBanner "ulimit parameters are set"
+fi
+
+echo 
+if [[ "$nodeType" == "zookeeper" ]] ;then
+	printBanner "Installing zookeeper binary"
+	download /static_content/ebay/montage/zookeeper.tar.gzip /usr/share/zookeeper.tar.gzip
+	tar xzf /usr/share/zookeeper.tar.gzip -C /usr/share/
+	printBanner "zookeeper binary installed"
+fi
+
+printBanner "Installing supervisorD daemon"
+apt-get -y install supervisor
+download /static_content/ebay/montage/conf.supervisord/${nodeType}.tar /etc/supervisor/conf.d/${nodeType}.tar
+tar xf /etc/supervisor/conf.d/${nodeType}.tar -C /etc/supervisor/conf.d/
+chown -R root:root /etc/supervisor/conf.d/
+rm -f /etc/supervisor/conf.d/${nodeType}.tar
+if ! grep -w ulimit /etc/init.d/supervisor >/dev/null 2>&1 ;then
+	lineNumber=$(grep -n -v ^# /etc/init.d/supervisor|head -1|cut -d: -f1)
+	sed -i "${lineNumber}aulimit -n 999999" /etc/init.d/supervisor
+fi
+sed -i -e '/\<minfds\>/d' -e '/\[supervisord\]/a minfds = 400000' /etc/supervisor/supervisord.conf
+printBanner "SupervisorD Configuration Done"
+
+printBanner "Configuring $nodeType"
+if [[ "$nodeType" == "supervisor" || "$nodeType" == "nimbus" ]] && [[ FORCE || ! -e /usr/share/storm/conf/storm.yaml ]];then
+	printBanner "Installing colo-specific storm.yaml"
+	if [[ -f ${nodeType}Template.yaml ]];then
+		printBanner "Using local storm.yaml created by newStormFactory"
+		cp -f "${nodeType}Template.yaml" /usr/share/storm/conf/storm.yaml
+	else
+		printBanner "Downloading storm.yaml from Cronus SREPO"
+		download /static_content/ebay/montage/conf.colo/$COLO/${nodeType}_storm.yaml /usr/share/storm/conf/storm.yaml
+	fi
+	printBanner "Colo-specific storm.yaml installed; Configuraton for $nodeType done"
+fi
+
+if [[ "$nodeType" == "zookeeper" ]] && [[ FORCE || ! -d /usr/etc/zookeeper ]];then
+	printBanner "Installing zookeeper config"
+	download /static_content/ebay/montage/conf.colo/$COLO/zookeeper.tar /tmp/zookeeper.tar
+	tar xf /tmp/zookeeper.tar -C /etc
+	if [[ -f zkTemplate.cfg ]];then
+		cp -f zkTemplate.cfg /etc/zookeeper/conf/zoo.cfg
+	fi
+	mkdir -p /usr/etc/zookeeper/
+	ln -nsf /etc/zookeeper/conf /usr/etc/zookeeper/conf
+	rm -rf /tmp/zookeeper.tar
+	
+	mkdir -p /usr/libexec 
+	download /static_content/ebay/montage/conf.colo/$COLO/zkEnv.sh /usr/libexec/zkEnv.sh
+	download /static_content/ebay/montage/zkServer.sh /usr/sbin/zkServer.sh
+	chmod a+x /usr/libexec/zkEnv.sh /usr/sbin/zkServer.sh
+	
+	mkdir -p /var/lib/zookeeper/ /var/log/zookeeper
+	chown zookeeper:zookeeper /var/lib/zookeeper/ /var/log/zookeeper
+	grep "$(hostname)" /etc/zookeeper/conf/zoo.cfg | cut -d= -f1 | cut -d. -f2 > /var/lib/zookeeper/myid
+	
+	printBanner "myid of zookeeper is set in /var/lib/zookeeper/myid"
+	printBanner "zookeeper config Installed"
+fi
+
+installTivoli
+
+printBanner "Starting $nodeType"
+service supervisor stop
+sleep 3
+pkill -f supervisord ||  pkill -9 -f supervisord
+service supervisor start
+sleep 3
+supervisorctl status
+

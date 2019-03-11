@@ -1,0 +1,457 @@
+#!/bin/bash
+# Author: Barry Shao
+# Version: 1.0
+
+#node type master -> nimbus, worker -> supervisor
+
+prgm=`basename $0`
+selfAbsPath="$(readlink -f $0)"
+binDir="$(dirname $selfAbsPath)" 
+baseDir="$(dirname $binDir)"
+confDir="${baseDir}/conf"
+FLAVOR=xlarge
+IMAGE="emi-ubuntu-12.04.2-server-amd64"
+#IMAGE="438cbfb1-73cb-4256-a461-31c4635991e3" #C3 team is having a bug when using image name
+#openrcFile="$confDir/openrc.sh"
+stormTarball="apache-storm-0.9.2-incubating.tar.gzip"
+
+zkInstancePrefix=montage-storm-zk
+masterInstancePrefix=montage-nimbus
+workerInstancePrefix=montage-supervisor
+
+trap "cd /var/tmp/;rm -f ${zkInstancePrefix}* ${masterInstancePrefix}* ${workerInstancePrefix}*;exit" SIGHUP SIGINT SIGTERM EXIT
+
+printBanner (){
+	echo "====================================================================="
+	echo "++++   $@"
+	echo "====================================================================="
+}
+
+confirm (){
+	read -p "$1 [Y/N]:" confirm
+	if [[ $confirm != "Y" && $confirm != "y" ]];then
+		echo quitting
+		exit
+	fi
+}
+countdown (){
+        local OLD_IFS="${IFS}"
+        IFS=":"
+        local ARR=( $1 )
+        local SECONDS=$((  (ARR[0] * 60 * 60) + (ARR[1] * 60) + ARR[2]  ))
+        local START=$(date +%s)
+        local END=$((START + SECONDS))
+        local CUR=$START
+
+        while [[ $CUR -lt $END ]]
+        do
+                CUR=$(date +%s)
+                LEFT=$((END-CUR))
+
+                printf "\r%02d:%02d:%02d I'm trying very hard on the cloud, you go get your coffee" $((LEFT/3600)) $(( (LEFT/60)%60)) $((LEFT%60))
+                sleep 1
+        done
+        IFS="${OLD_IFS}"
+        echo "        "
+}
+
+usage (){
+     echo "
+Usage: 
+     $prgm -c COLO -e COS -m NUM -w NUM -z NUM --rc OPENRC [-p HOST] [--flavor FLAVOR] [--image IMAGE] [-v stormTarball] [--mas applicationServices] [--zas applicationServices] [--was applicationServices]
+     $prgm -c COLO -e COS -m HOST -w NUM --rc OPENRC [--flavor FLAVOR] [--image IMAGE] [-v stormTarball] [--mas applicationServices] [--zas applicationServices] [--was applicationServices]
+     $prgm --flavor list --rc OPENRC
+     $prgm --image  list --rc OPENRC
+
+This is used to create new VMs in OpenStack
+
+     -c 	COLO is slc, phx or lvs, it's used for colo-specific configuration
+     -e 	environment: prod, pre_prod, qa, dev
+     -m 	number of nimbus host,or nimbus host to which we add capacity
+     -w 	number of supervisor host
+     -z 	number of zookeeper host
+     -p		nimbus host from whose supervisor we copy montage.{COS}.property, if a host is passed to -m or conf/montage.{COS}.property exists(deleted after use), we use it.
+     --flavor 	size of VM,e.g. tiny, small, medium, large, xlarge(by default), etc. (see $prgm --flavor list)
+     --image    image names or ID(preferred, because of possiblly duplicate names), (see $prgm --image list), emi-ubuntu-12.04.2-server-amd64 by default
+     --rc 	credentials for C3 Service ('https://wiki.vip.corp.ebay.com/pages/viewpage.action?spaceKey=Montage&title=Automated+capacity+addition+Storm')
+     --mas      comman-seperated list of ApplicationServcie resourceID for provisioned nimbus(master) boxes
+     --zas      comman-seperated list of ApplicationServcie resourceID for provisioned zookeeper boxes
+     --was      comman-seperated list of ApplicationServcie resourceID for provisioned worker(supervisor) boxes
+     -v 	storm tarball name in cronus srepo, check http://cronus-srepo.vip.ebay.com/packages/mp/montageapi/storm/static_content/ebay/montage/
+Example:
+     * create a cluster with 1 nimbus, 1 supervisor and 1 zookeeper with credentials in ../conf/openrc.sh, don't create montage property files
+     $prgm -c lvs -e qa -m 1 -w 1 -z 1 --rc ../conf/openrc.sh
+
+     * list available flavor
+     $prgm --flavor list --rc ../conf/openrc.sh
+
+     * create storm 1.0 xlarge cluster:3 nimbus, 20 supervisors and 3 zookeepers with montage properties from montage-nimbus2-366495, applicationServcie mm:ENV123,MM:ENV321
+     $prgm -c lvs -e prod -m 3 -w 20 -z 3 --rc ../conf/birshao-openrc.sh -p montage-nimbus2-366495.stratus.phx.ebay.com --flavor xlarge -v apache-storm-1.0.1.tar.gz --mas mm:ENV123,MM:ENV321 -zas zk:ENV1 -was workers:ENV2
+
+     * add 3 more supervisors to a storm 1.0.1 cluster whose Nimbus is montage-nimbus4-1147776.stratus.lvs.ebay.com
+     $prgm -c lvs -e prod -m montage-nimbus4-1147776.stratus.lvs.ebay.com -w 3 -v apache-storm-1.0.1.tar.gz --rc ../conf/openrc.sh
+
+     * create only 2 xlarge emi-centos-6.5-x86_64 supervisors with your own credentials
+     $prgm -c lvs -e qa -w 2 --image emi-centos-6.5-x86_64 --rc /PATH/TO/YOUR/CREDENTIAL "
+}
+
+
+while getopts "c:e:m:w:z:p:-:hv:" opt; do
+  case $opt in
+    -)
+      case $OPTARG in 
+           flavor)
+                 FLAVOR=${!OPTIND}
+                 ((OPTIND++))
+                 ;;
+           image)
+                 IMAGE=${!OPTIND}
+                 ((OPTIND++))
+                 ;;
+           rc)
+                 openrcFile=${!OPTIND}
+                 ((OPTIND++))
+                 ;;
+           mas)
+                 mApplicationServices=${!OPTIND}
+                 ((OPTIND++))
+                 ;;
+           zas)
+                 zApplicationServices=${!OPTIND}
+                 ((OPTIND++))
+                 ;;
+           was)
+                 wApplicationServices=${!OPTIND}
+                 ((OPTIND++))
+                 ;;
+      esac
+      ;;
+    w)
+      workerNumber="$OPTARG"
+      ;;
+    m)
+      if [[ $OPTARG =~ ^[0-9]+$ ]];then
+		masterNumber="$OPTARG"
+      else
+		newStormParamMaster="$OPTARG"
+		nimbusWeAddCapacity="$newStormParamMaster"
+		masterNumber=0
+      fi
+      ;;
+    z)
+      zkNumber="$OPTARG"
+      ;;
+    p)
+      nimbusHavingProperty="$OPTARG"
+      ;;
+    c)
+      COLO=$(echo "$OPTARG"|tr '[:upper:]' '[:lower:]')
+      ;;
+    e)
+      COS="$(echo $OPTARG|tr '[:upper:]' '[:lower:]')"
+      if [[ ${COS:0:4} == prod ]];then 
+          COS=production
+      fi
+      ;;
+    v)
+     stormTarball="$OPTARG"
+      ;;
+    \?|h)
+       usage
+       exit 
+       ;;
+  esac
+done
+
+if [[ -z $nimbusHavingProperty ]] && [[ -n $nimbusWeAddCapacity ]];then
+	nimbusHavingProperty="$nimbusWeAddCapacity"
+fi
+
+if [[ -z "$openrcFile" || -z "$COS" && -z "$FLAVOR" && -z "$IMAGE" || -z $workerNumber && -z $masterNumber && -z $zkNumber && $IMAGE != "list" && $FLAVOR != "list" || "$COLO" != slc && "$COLO" != phx && "$COLO" != lvs && $IMAGE != "list" && $FLAVOR != "list" ]];then
+      usage
+      exit 2
+
+fi
+
+if [[ $masterNumber -gt 1 && $stormTarball == apache-storm-0.9* ]];then
+	echo Storm 1.0 below supports only one Nimbus, use newer Storm tarball or specify 1 to -w
+	exit 2
+fi
+
+#prerequisite: nova client
+printBanner "checking nova client and python fabric"
+if ! command -v nova >/dev/null;then
+	printBanner "nova client is not installed, let me do it for you"
+	echo sudo apt-get -qy install python-novaclient
+	sudo apt-get -qy install python-novaclient
+	if [[ $? -ne 0 ]];then
+		printBanner "failed to install nova client, please fix it first"
+		exit 1
+	fi
+fi
+
+if ! dpkg --compare-versions "$(fab --version 2>/dev/null| grep Fabric | cut -d' ' -f2)" ge 1.12; then
+	echo sudo apt-get -qy install python-pip
+	sudo apt-get -qy install python-pip
+	export http_proxy=http://httpproxy.vip.ebay.com:80
+	export https_proxy=$http_proxy
+	echo sudo -E bash -c 'pip install fabric'
+	sudo -E bash -c 'pip install fabric'
+	if ! dpkg --compare-versions "$(fab --version | grep Fabric | cut -d' ' -f2)" ge 1.12; then
+		printBanner "fabric version < 1.12.0, please upgrade it first"
+		exit 1
+	fi
+fi
+
+#import credential
+. "$openrcFile"
+if [[ $FLAVOR == "list" ]]; then
+	nova flavor-list
+	exit
+elif [[ $IMAGE == "list" ]]; then
+	nova image-list
+	exit
+fi
+
+#confirm colo provided by commandline matches that in credential
+if [[ $OS_REGION_NAME != $COLO* ]]; then 
+	echo -e "\e[31mThe 3-letter prefix of \$OS_REGION_NAME($OS_REGION_NAME) in $openrcFile doesn't match COLO parameter($COLO) provided in your commandline\e[0m"
+	echo "please modify your credential file or pass a correct colo parameter"
+	exit 1
+fi
+printBanner Colo: $COLO matches your openrc credential
+
+if ((masterNumber > 0 ));then
+	currentLargestIndex=$(nova list --name "$masterInstancePrefix" | grep "$masterInstancePrefix" | cut -d'|' -f3 | sed "s/\s*$masterInstancePrefix//" | sort -nr | head -1)
+	[[ -z $currentLargestIndex ]] && currentLargestIndex=0
+	end=$((currentLargestIndex + masterNumber))
+	for (( current = currentLargestIndex + 1 ; current <= end; current++ )); do
+		host="$masterInstancePrefix$current"
+		vmBooting+=("$host")
+		masterVMList+=("$host")
+	done
+fi
+
+if ((zkNumber > 0 ));then
+	currentLargestIndex=$(nova list --name "$zkInstancePrefix" | grep "$zkInstancePrefix" | cut -d'|' -f3 | sed "s/\s*$zkInstancePrefix//" | sort -nr | head -1)
+	[[ -z $currentLargestIndex ]] && currentLargestIndex=0
+	end=$((currentLargestIndex + zkNumber))
+	for (( current = currentLargestIndex + 1 ; current <= end; current++ )); do
+		host="$zkInstancePrefix$current"
+		vmBooting+=($host)
+		zkVMList+=("$host")
+	done
+fi
+
+if ((workerNumber > 0 ));then
+	currentLargestIndex=$(nova list --name "$workerInstancePrefix" | grep "$workerInstancePrefix" | cut -d'|' -f3 | sed "s/\s*$workerInstancePrefix//" | sort -nr | head -1)
+	[[ -z $currentLargestIndex ]] && currentLargestIndex=0
+	end=$((currentLargestIndex + workerNumber))
+	for (( current = currentLargestIndex + 1 ; current <= end; current++ )); do
+		host="$workerInstancePrefix$current"
+		vmBooting+=("$host")
+		workerVMList+=("$host")
+	done
+fi
+
+printBanner Provision Summary
+echo -e "FLAVOR: $FLAVOR\nIMAGE: $IMAGE\nHOSTS: ${vmBooting[@]}\n"
+echo "/ebay/.metadata will be classOfService=$COS"
+if [[ -z $nimbusHavingProperty ]];then
+	echo "/ebay/montage.${COS}.properties won't be created because you aren't telling me where do I get it(-p)"
+else
+	echo "/ebay/montage.${COS}.properties will be copied from one of supervisors managed by $nimbusHavingProperty"
+fi
+
+if [[ -z $nimbusWeAddCapacity ]]; then
+	if [[ -n $mApplicationServices ]];then
+		echo "The applicationServices for nimbus servers will be $mApplicationServices in odb_function.txt"
+	else
+		echo "odb_function.txt won't be created because you aren't telling me what applicationServices are for nimbus servers"
+	fi
+fi
+	
+if [[ -n $zkNumber ]]; then
+	if [[ -n $zApplicationServices ]];then
+		echo "The applicationServices for zookeeper servers will be $zApplicationServices in odb_function.txt"
+	else
+		echo "odb_function.txt won't be created because you aren't telling me what applicationServices are for zookeeper servers"
+	fi
+fi
+
+if [[ -n $workerNumber ]]; then
+	if [[ -n $wApplicationServices ]];then
+		echo "The applicationServices for supervisor servers will be $wApplicationServices in odb_function.txt"
+	elif [[ -n $nimbusWeAddCapacity ]];then
+		echo "The applicationServices for supervisor servers will be copied from peers managed by $nimbusWeAddCapacity"
+	else
+		echo "odb_function.txt won't be created because you aren't telling me what applicationServices are for supervisor servers"
+	fi
+fi
+
+confirm "Good to Go ?"
+
+for instance in "${vmBooting[@]}";do
+	printf 'provisioning %14s %-23s, meta info will be available in /var/tmp/%s\n' $FLAVOR $instance $instance
+	(nova boot --flavor "$FLAVOR" --image "$IMAGE" "$instance"  > /var/tmp/"$instance") &
+	pids+="$! "
+done
+
+(countdown "00:15:00") &
+wait $pids 2>/dev/null
+kill $! 2>/dev/null
+wait $! 2>/dev/null
+echo
+
+printBanner "collecting VM IDs"
+
+declare -A hostIDHash
+for i in ${!vmBooting[@]};do
+	if [[ -s /var/tmp/${vmBooting[$i]} ]]; then
+		id="$(cat /var/tmp/${vmBooting[$i]} | grep -w id | awk '{print $4}')"
+		hostIDHash["${vmBooting[$i]}"]="$id"
+	fi
+done
+
+printBanner "booting up VMs (timeout: 2m)"
+
+#timeout is 1200 seconds
+deadline=$((SECONDS+1200))
+while ((${#vmBooting[@]} > 0 )); do
+	if (( $SECONDS > $deadline ));then
+		echo VM Status Checing timeout
+		break
+	fi
+	for i in ${!vmBooting[@]}; do
+		stat=$(nova list --name ${vmBooting[$i]} | grep  ${vmBooting[$i]} | awk '{print $6}')
+		if [[ $stat == "ACTIVE" ]]; then
+			printf '%-23s is up and running\n' ${vmBooting[$i]} 
+			unset vmBooting[$i]
+		elif [[ $stat == "ERROR" ]]; then #if any other error status, we can use $stat != "BUILD" && $stat != "ACTIVE"
+			echo -e "\e[31m${vmBooting[$i]} got errors in booting\e[0m"
+			vmError+=("${vmBooting[$i]}")
+			unset vmBooting[$i]
+		fi
+	done
+done
+
+if [[ -z $vmError && -z $vmBooting ]]; then
+	printBanner "all VMs are up and running now"
+else
+	printBanner "all VMs are up and running now except the below, please diagnose it in https://c3.corp.ebay.com"
+	echo -e "\e[31m${vmError[@]} ${vmBooting[@]} \e[0m"
+	echo "but let's still go with FQDN check"
+fi
+
+printBanner "getting their FQDN"
+
+declare -A hostFQDNList
+if ((zkNumber > 0 ));then
+	for host in ${zkVMList[@]};do
+		echo get FQDN of $host
+		id="${hostIDHash[$host]}"
+		if [[ -z $id ]]; then
+			echo "It seems C3 didn't create $host, please check https://c3.corp.ebay.com"
+			continue
+		fi
+		while true;do
+			fqdn=$(nova show $id | grep -o 'fqdn[^,]*' | grep -o "[^'\"]*com")
+			[[ -n $fqdn ]] && break
+			sleep 1
+		done
+		hostFQDNList["$host"]="$fqdn"
+		newStormParamZk+="${fqdn},"
+	done
+	newStormParamZk=${newStormParamZk%,}
+fi
+
+if ((masterNumber > 0 ));then
+	for host in ${masterVMList[@]};do
+		echo get FQDN of $host
+		id=${hostIDHash[$host]}
+		if [[ -z $id ]]; then
+			echo "It seems C3 didn't create $host, please check https://c3.corp.ebay.com"
+			continue
+		fi
+		while true;do
+			fqdn=$(nova show $id | grep -o 'fqdn[^,]*' | grep -o "[^'\"]*com")
+			[[ -n $fqdn ]] && break
+			sleep 1
+		done
+		hostFQDNList["$host"]="$fqdn"
+		newStormParamMaster+="$fqdn,"
+	done
+	newStormParamMaster=${newStormParamMaster%,}
+fi
+if ((workerNumber > 0 ));then
+	for host in "${workerVMList[@]}";do
+		echo get FQDN of $host
+		id="${hostIDHash[$host]}"
+		if [[ -z $id ]]; then
+			echo "It seems C3 didn't create $host, please check https://c3.corp.ebay.com"
+			continue
+		fi
+		while true;do
+			fqdn=$(nova show $id | grep -o 'fqdn[^,]*' | grep -o "[^'\"]*com")
+			[[ -n $fqdn ]] && break
+			sleep 1
+		done
+		hostFQDNList["$host"]="$fqdn"
+		newStormParamWorker+="${fqdn},"
+	done
+	newStormParamWorker=${newStormParamWorker%,}
+fi
+
+#for k in ${!hostFQDNList[@]};do echo $k ${hostFQDNList[$k]};done
+
+checkConnectivity (){
+	printBanner "checking connectivity to remote servers"
+	sleep 30
+	for k in ${!hostFQDNList[@]};do 
+		echo checking $k
+		while true;do
+			echo nc -z "${hostFQDNList[$k]}" 22
+			if nc -z "${hostFQDNList[$k]}" 22 >/dev/null 2>&1;then
+				echo connectivity check passed for ${hostFQDNList[$k]} 
+				break
+			fi
+			sleep 2
+		done
+		echo $k is pingable now
+	done
+}
+
+if [[ -n "$newStormParamMaster" && -n "$newStormParamWorker" && -n "$newStormParamZk" ]]; then
+	echo run the below to create a brand-new storm cluster
+	cmd="$binDir/newStormFactory -c ${COLO} -e ${COS} -m $newStormParamMaster -w $newStormParamWorker -z $newStormParamZk -v $stormTarball"
+	[[ -n $nimbusHavingProperty ]] && cmd="$cmd -p $nimbusHavingProperty"
+	[[ -n $mApplicationServices ]] && cmd="$cmd --mas $mApplicationServices"
+	[[ -n $zApplicationServices ]] && cmd="$cmd --zas $zApplicationServices"
+	[[ -n $wApplicationServices ]] && cmd="$cmd --was $wApplicationServices"
+	echo "$cmd"
+	confirm "Run It?"
+
+	checkConnectivity
+	$cmd
+
+elif [[ -n "$newStormParamWorker" && -n "$newStormParamMaster" ]];then
+	echo It seems you wannna add "$newStormParamWorker" to cluster "$newStormParamMaster"?
+	echo run the below to to add supervisors
+	activeNimbus=${newStormParamMaster%%,}
+	cmd="$binDir/newStormFactory -c ${COLO} -e ${COS} --add $newStormParamWorker -v $stormTarball -m $activeNimbus"
+	[[ -n $wApplicationServices ]] && cmd="$cmd --was $wApplicationServices"
+	echo $cmd
+	confirm "Run It?"
+
+	checkConnectivity
+	$cmd
+
+elif [[ -n "$newStormParamWorker" ]];then
+	echo seems you want to add supervisors to existing storm cluster, if so, run this with your nimbus:
+	cmd="$binDir/newStormFactory -c ${COLO} -e ${COS} --add $newStormParamWorker -v $stormTarball"
+	[[ -n $wApplicationServices ]] && cmd="$cmd --was $wApplicationServices"
+	cmd="$cmd -m ReplactThisWithNimbusHost"
+	echo $cmd
+fi
+
+exit
